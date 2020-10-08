@@ -28,7 +28,7 @@ analyze: SKA_degrid.o GPU_SKA_degrid.o Makefile
 	$(NVCC) -o $(ANALYZE) SKA_degrid.o GPU_SKA_degrid.o  $(LIB) $(NVCCFLAGS) 
 
 GPU_SKA_degrid.o: timer.h utils_cuda.h
-	$(NVCC) -c GPU_SKA_degrid.cu $(NVCCFLAGS)
+	$(NVCC) -c -dc GPU_SKA_degrid.cu $(NVCCFLAGS)
 	
 SKA_degrid.o: SKA_degrid.cpp
 	$(GCC) -c SKA_degrid.cpp $(GCC_OPTS)

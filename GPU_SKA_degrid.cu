@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
 #include "debug.h"
+#include "params.h"
 #include "timer.h"
 #include "utils_cuda.h"
 
@@ -12,33 +13,36 @@
 
 using namespace std;
 
-
 class SKA_degrid_params {
 public:
-	static const int nRows_per_thread = 1;
 	static const int warp = 32;
 };
 
-#define NTHREADS 256
-#define Y_STEPS 4
-#define X_STEPS 4
+class SKA_degrid_8_8_4 : public SKA_degrid_params {
+public:
+	static const int uv_kernel_size = 8;
+	static const int uv_kernel_stride = 8;
+	static const int uv_oversample = 16384;
+	static const int w_kernel_size = 4;
+	static const int w_kernel_stride = 4;
+	static const int w_oversample = 16384;
+	static const int grid_x = 512;
+	static const int grid_y = 512;
+	static const int grid_z = 4;
+};
+
+
+
 #define HALF_WARP 16
-#define NSEEDS 32
 #define WARP 32
-#define BUFFER 32
+
 
 // ***********************************************************************************
 // ***********************************************************************************
 // ***********************************************************************************
 
+template<class const_params>
 __inline__ __device__ void calculate_coordinates(
-		int grid_size, //dimension of the image's subgrid grid_size x grid_size x 4?
-		int kernel_size, // gcf kernel support
-		int kernel_stride, // padding of the gcf kernel
-		int oversample, // oversampling of the uv kernel
-		int wkernel_size, // gcf in w kernel support
-		int wkernel_stride, // padding of the gcf w kernel
-		int oversample_w, // oversampling of the w kernel
 		double theta, //conversion parameter from uv coordinates to xy coordinates x=u*theta
 		double wstep, //conversion parameter from w coordinates to z coordinates z=w*wstep 
 		double u, // 
@@ -51,35 +55,31 @@ __inline__ __device__ void calculate_coordinates(
 	){
 	// x coordinate
 	double x = theta*u;
-	double ox = x*oversample;
-	//int iox = lrint(ox);
-	int iox = round(ox); // round to nearest
-    iox += (grid_size / 2 + 1) * oversample - 1;
-    int home_x = iox / oversample;
-    int frac_x = oversample - 1 - (iox % oversample);
+	double ox = x*const_params::uv_oversample;
+	int iox = __double2int_rn(ox); // round to nearest
+    iox += (const_params::grid_x / 2 + 1) * const_params::uv_oversample - 1;
+    int home_x = iox / const_params::uv_oversample;
+    int frac_x = const_params::uv_oversample - 1 - (iox % const_params::uv_oversample);
 	
 	// y coordinate
 	double y = theta*v;
-	double oy = y*oversample;
-	//int iox = lrint(ox);
-	int ioy = round(oy);
-    ioy += (grid_size / 2 + 1) * oversample - 1;
-    int home_y = ioy / oversample;
-    int frac_y = oversample - 1 - (ioy % oversample);
+	double oy = y*const_params::uv_oversample;
+	int ioy = __double2int_rn(oy);
+    ioy += (const_params::grid_x / 2 + 1) * const_params::uv_oversample - 1;
+    int home_y = ioy / const_params::uv_oversample;
+    int frac_y = const_params::uv_oversample - 1 - (ioy % const_params::uv_oversample);
 	
 	// w coordinate
 	double z = 1.0 + w/wstep;
-	double oz = z*oversample_w;
-	//int iox = lrint(ox);
-	int ioz = round(oz);
-    ioz += oversample_w - 1;
-    //int home_z = ioz / oversample_w;
-    int frac_z = oversample_w - 1 - (ioz % oversample_w);
+	double oz = z*const_params::w_oversample;
+	int ioz = __double2int_rn(oz);
+    ioz += const_params::w_oversample - 1;
+    int frac_z = const_params::w_oversample - 1 - (ioz % const_params::w_oversample);
 	
-    *grid_offset = (home_y-kernel_size/2)*grid_size + (home_x-kernel_size/2);
-    *sub_offset_x = kernel_stride * frac_x;
-    *sub_offset_y = kernel_stride * frac_y;
-    *sub_offset_z = wkernel_stride * frac_z;
+    *grid_offset = (home_y-const_params::uv_kernel_size/2)*const_params::grid_x + (home_x-const_params::uv_kernel_size/2);
+    *sub_offset_x = const_params::uv_kernel_stride * frac_x;
+    *sub_offset_y = const_params::uv_kernel_stride * frac_y;
+    *sub_offset_z = const_params::w_kernel_stride * frac_z;
 }
 
 __device__ __inline__ double2 Reduce_SM(double2 *s_data){
@@ -115,35 +115,27 @@ template<class const_params>
 __global__ void GPU_SKA_degrid_kernel_mk1(
 		double2 *d_output_visibilities, 
 		double *d_gcf_uv_kernel, 
-		int uv_kernel_size, 
-		int uv_kernel_stride, 
-		int uv_kernel_oversampling, 
 		double *d_gcf_w_kernel, 
-		int w_kernel_size, 
-		int w_kernel_stride, 
-		int w_kernel_oversampling, 
 		double2 *d_subgrid, 
-		int grid_z, 
-		int grid_y, 
-		int grid_x, 
 		double *d_u_vis_pos, 
 		double *d_v_vis_pos, 
 		double *d_w_vis_pos, 
-		int nVisibilities, 
+		int *nVisibilities, 
 		double theta,
 		double wstep
 	){
 	extern __shared__ double2 s_local[];
+	int active_nVisibilities = nVisibilities[blockIdx.y + 1] - nVisibilities[blockIdx.y];
+	if(blockIdx.x >= active_nVisibilities) {
+		return;
+	}
 	
 	int grid_offset, sub_offset_x, sub_offset_y, sub_offset_z;
-	calculate_coordinates(
-		grid_x,
-		uv_kernel_size, uv_kernel_stride, uv_kernel_oversampling,
-		w_kernel_stride, w_kernel_stride, w_kernel_oversampling,
+	calculate_coordinates<const_params>(
 		theta, wstep, 
-		d_u_vis_pos[blockIdx.y*nVisibilities + blockIdx.x], 
-		d_v_vis_pos[blockIdx.y*nVisibilities + blockIdx.x], 
-		d_w_vis_pos[blockIdx.y*nVisibilities + blockIdx.x],
+		d_u_vis_pos[nVisibilities[blockIdx.y] + blockIdx.x], 
+		d_v_vis_pos[nVisibilities[blockIdx.y] + blockIdx.x], 
+		d_w_vis_pos[nVisibilities[blockIdx.y] + blockIdx.x],
 		&grid_offset, 
 		&sub_offset_x, &sub_offset_y, &sub_offset_z
 	);
@@ -153,12 +145,16 @@ __global__ void GPU_SKA_degrid_kernel_mk1(
 	int local_x = (threadIdx.x&7);
 	int local_y = (threadIdx.x>>3);
 	
-	for (int z = 0; z < w_kernel_size; z++) {
-		double2 grid_value = d_subgrid[blockIdx.y*grid_z*grid_y*grid_x + z*grid_x*grid_y + grid_offset + local_y*grid_y + local_x];
+	for (int z = 0; z < const_params::w_kernel_size; z++) {
+		double2 grid_value = d_subgrid[blockIdx.y*const_params::grid_z*const_params::grid_y*const_params::grid_x + z*const_params::grid_x*const_params::grid_y + grid_offset + local_y*const_params::grid_y + local_x];
 		
-		vis.x += d_gcf_w_kernel[sub_offset_z + z]*d_gcf_uv_kernel[sub_offset_y + local_y]*d_gcf_uv_kernel[sub_offset_x + local_x]*grid_value.x;
-		vis.y += d_gcf_w_kernel[sub_offset_z + z]*d_gcf_uv_kernel[sub_offset_y + local_y]*d_gcf_uv_kernel[sub_offset_x + local_x]*grid_value.y;
+		//vis.x += d_gcf_w_kernel[sub_offset_z + z]*d_gcf_uv_kernel[sub_offset_y + local_y]*d_gcf_uv_kernel[sub_offset_x + local_x]*grid_value.x;
+		//vis.y += d_gcf_w_kernel[sub_offset_z + z]*d_gcf_uv_kernel[sub_offset_y + local_y]*d_gcf_uv_kernel[sub_offset_x + local_x]*grid_value.y;
+		vis.x += d_gcf_w_kernel[sub_offset_z + z]*grid_value.x;
+		vis.y += d_gcf_w_kernel[sub_offset_z + z]*grid_value.y;
 	}
+	vis.x *= d_gcf_uv_kernel[sub_offset_y + local_y]*d_gcf_uv_kernel[sub_offset_x + local_x];
+	vis.y *= d_gcf_uv_kernel[sub_offset_y + local_y]*d_gcf_uv_kernel[sub_offset_x + local_x];
 	
 	// NOTE: Reduction checked
 	s_local[threadIdx.x] = vis;
@@ -168,20 +164,454 @@ __global__ void GPU_SKA_degrid_kernel_mk1(
 	Reduce_WARP(&sum);	
 	__syncthreads();
 	
-	if(threadIdx.x==0) d_output_visibilities[blockIdx.y*nVisibilities + blockIdx.x] = sum;
+	if(threadIdx.x==0) {
+		d_output_visibilities[nVisibilities[blockIdx.y] + blockIdx.x] = sum;
+	}
+}
+
+template<class const_params>
+__global__ void GPU_SKA_degrid_kernel_mk1_for_dynamic(
+		double2 *d_output_visibilities, 
+		double *d_gcf_uv_kernel, 
+		double *d_gcf_w_kernel, 
+		double2 *d_subgrid, 
+		double *d_u_vis_pos, 
+		double *d_v_vis_pos, 
+		double *d_w_vis_pos, 
+		int *nVisibilities, 
+		double theta,
+		double wstep,
+		int block_y
+	){
+	extern __shared__ double2 s_local[];
+	
+	int grid_offset, sub_offset_x, sub_offset_y, sub_offset_z;
+	calculate_coordinates<const_params>(
+		theta, wstep, 
+		d_u_vis_pos[nVisibilities[block_y] + blockIdx.x], 
+		d_v_vis_pos[nVisibilities[block_y] + blockIdx.x], 
+		d_w_vis_pos[nVisibilities[block_y] + blockIdx.x],
+		&grid_offset, 
+		&sub_offset_x, &sub_offset_y, &sub_offset_z
+	);
+	
+	double2 vis;
+	vis.x = 0; vis.y = 0;
+	int local_x = (threadIdx.x&7);
+	int local_y = (threadIdx.x>>3);
+	
+	for (int z = 0; z < const_params::w_kernel_size; z++) {
+		double2 grid_value = d_subgrid[block_y*const_params::grid_z*const_params::grid_y*const_params::grid_x + z*const_params::grid_x*const_params::grid_y + grid_offset + local_y*const_params::grid_y + local_x];
+		
+		//vis.x += d_gcf_w_kernel[sub_offset_z + z]*d_gcf_uv_kernel[sub_offset_y + local_y]*d_gcf_uv_kernel[sub_offset_x + local_x]*grid_value.x;
+		//vis.y += d_gcf_w_kernel[sub_offset_z + z]*d_gcf_uv_kernel[sub_offset_y + local_y]*d_gcf_uv_kernel[sub_offset_x + local_x]*grid_value.y;
+		vis.x += d_gcf_w_kernel[sub_offset_z + z]*grid_value.x;
+		vis.y += d_gcf_w_kernel[sub_offset_z + z]*grid_value.y;
+	}
+	vis.x *= d_gcf_uv_kernel[sub_offset_y + local_y]*d_gcf_uv_kernel[sub_offset_x + local_x];
+	vis.y *= d_gcf_uv_kernel[sub_offset_y + local_y]*d_gcf_uv_kernel[sub_offset_x + local_x];
+	
+	// NOTE: Reduction checked
+	s_local[threadIdx.x] = vis;
+	__syncthreads();
+	double2 sum;
+	sum = Reduce_SM(s_local);
+	Reduce_WARP(&sum);	
+	__syncthreads();
+	
+	if(threadIdx.x==0) {
+		d_output_visibilities[nVisibilities[block_y] + blockIdx.x] = sum;
+	}
+}
+
+template<class const_params>
+__global__ void GPU_SKA_degrid_kernel_mk1_dynamic(
+		double2 *d_output_visibilities, 
+		double *d_gcf_uv_kernel, 
+		double *d_gcf_w_kernel, 
+		double2 *d_subgrid, 
+		double *d_u_vis_pos, 
+		double *d_v_vis_pos, 
+		double *d_w_vis_pos, 
+		int *d_nVisibilities, 
+		double theta,
+		double wstep
+	){
+	// each thread represent one subgrid
+	int active_nVisibilities = d_nVisibilities[threadIdx.x + 1] - d_nVisibilities[threadIdx.x];
+	dim3 gridSize(active_nVisibilities, 1, 1);
+	dim3 blockSize(const_params::uv_kernel_stride*const_params::uv_kernel_stride, 1, 1);
+	int shared_mem = const_params::uv_kernel_stride*const_params::uv_kernel_stride*sizeof(double2);
+	GPU_SKA_degrid_kernel_mk1_for_dynamic<const_params><<< gridSize , blockSize, shared_mem >>>(
+		d_output_visibilities, 
+		d_gcf_uv_kernel,
+		d_gcf_w_kernel,
+		d_subgrid,
+		d_u_vis_pos, 
+		d_v_vis_pos, 
+		d_w_vis_pos, 
+		d_nVisibilities, 
+		theta, 
+		wstep,
+		threadIdx.x
+	);
+	
 }
 
 
+template<class const_params>
+__global__ void GPU_SKA_degrid_kernel_mk2(
+		double2 *d_output_visibilities, 
+		double *d_gcf_uv_kernel, 
+		double *d_gcf_w_kernel, 
+		double2 *d_subgrid, 
+		double *d_u_vis_pos, 
+		double *d_v_vis_pos, 
+		double *d_w_vis_pos, 
+		int *nVisibilities, 
+		double theta,
+		double wstep
+	){
+	extern __shared__ double2 s_local[];
+	int active_nVisibilities = nVisibilities[blockIdx.y + 1] - nVisibilities[blockIdx.y];
+	if(blockIdx.x*NVIS_PER_BLOCK >= active_nVisibilities) {
+		return;
+	}
+	
+	int grid_offset, sub_offset_x, sub_offset_y, sub_offset_z;
+	for(int f=0; f<NVIS_PER_BLOCK; f++){
+		if( blockIdx.x*NVIS_PER_BLOCK + f < active_nVisibilities ){
+			int pos = nVisibilities[blockIdx.y] + blockIdx.x*NVIS_PER_BLOCK + f;
+			calculate_coordinates<const_params>(
+				theta, wstep, 
+				d_u_vis_pos[pos], 
+				d_v_vis_pos[pos], 
+				d_w_vis_pos[pos],
+				&grid_offset, 
+				&sub_offset_x, &sub_offset_y, &sub_offset_z
+			);
+			
+			double2 vis;
+			vis.x = 0; vis.y = 0;
+			int local_x = (threadIdx.x&7);
+			int local_y = (threadIdx.x>>3);
+			grid_offset = blockIdx.y*const_params::grid_z*const_params::grid_y*const_params::grid_x + grid_offset + local_y*const_params::grid_y + local_x;
+			
+			for (int z = 0; z < const_params::w_kernel_size; z++) {
+				double2 grid_value = d_subgrid[grid_offset + z*const_params::grid_x*const_params::grid_y];
+				
+				//vis.x += d_gcf_w_kernel[sub_offset_z + z]*d_gcf_uv_kernel[sub_offset_y + local_y]*d_gcf_uv_kernel[sub_offset_x + local_x]*grid_value.x;
+				//vis.y += d_gcf_w_kernel[sub_offset_z + z]*d_gcf_uv_kernel[sub_offset_y + local_y]*d_gcf_uv_kernel[sub_offset_x + local_x]*grid_value.y;
+				vis.x += d_gcf_w_kernel[sub_offset_z + z]*grid_value.x;
+				vis.y += d_gcf_w_kernel[sub_offset_z + z]*grid_value.y;
+			}
+			vis.x *= d_gcf_uv_kernel[sub_offset_y + local_y]*d_gcf_uv_kernel[sub_offset_x + local_x];
+			vis.y *= d_gcf_uv_kernel[sub_offset_y + local_y]*d_gcf_uv_kernel[sub_offset_x + local_x];
+			
+			// NOTE: Reduction checked
+			s_local[threadIdx.x] = vis;
+			__syncthreads();
+			double2 sum;
+			sum = Reduce_SM(s_local);
+			Reduce_WARP(&sum);	
+			__syncthreads();
+			
+			if(threadIdx.x==0) {
+				d_output_visibilities[pos] = sum;
+			}
+		}
+	}
+}
+
+
+template<class const_params>
+__global__ void GPU_SKA_degrid_kernel_mk3(
+		double2 *d_output_visibilities, 
+		double *d_gcf_uv_kernel, 
+		double *d_gcf_w_kernel, 
+		double2 *d_subgrid, 
+		double *d_u_vis_pos, 
+		double *d_v_vis_pos, 
+		double *d_w_vis_pos, 
+		int *nVisibilities, 
+		double theta,
+		double wstep
+	){
+	extern __shared__ double2 s_local[];
+	int active_nVisibilities = nVisibilities[blockIdx.y + 1] - nVisibilities[blockIdx.y];
+	__shared__ int s_coordinates[NVIS_PER_BLOCK*4];
+	if(blockIdx.x*NVIS_PER_BLOCK >= active_nVisibilities) {
+		return;
+	}
+	
+	// precalculate coordinates;
+	if(threadIdx.x<NVIS_PER_BLOCK){
+		int grid_offset, sub_offset_x, sub_offset_y, sub_offset_z;
+		int pos = nVisibilities[blockIdx.y] + blockIdx.x*NVIS_PER_BLOCK + threadIdx.x;
+		calculate_coordinates<const_params>(
+			theta, wstep, 
+			d_u_vis_pos[pos], 
+			d_v_vis_pos[pos], 
+			d_w_vis_pos[pos],
+			&grid_offset, 
+			&sub_offset_x, &sub_offset_y, &sub_offset_z
+		);
+		s_coordinates[threadIdx.x                   ] = grid_offset;
+		s_coordinates[threadIdx.x + NVIS_PER_BLOCK  ] = sub_offset_x;
+		s_coordinates[threadIdx.x + 2*NVIS_PER_BLOCK] = sub_offset_y;
+		s_coordinates[threadIdx.x + 3*NVIS_PER_BLOCK] = sub_offset_z;
+	}
+	__syncthreads();
+	
+	
+	for(int f=0; f<NVIS_PER_BLOCK; f++){
+		if( blockIdx.x*NVIS_PER_BLOCK + f < active_nVisibilities ){
+			int grid_offset, sub_offset_x, sub_offset_y, sub_offset_z;
+			grid_offset  = s_coordinates[f];
+			sub_offset_x = s_coordinates[f + NVIS_PER_BLOCK  ];
+			sub_offset_y = s_coordinates[f + 2*NVIS_PER_BLOCK];
+			sub_offset_z = s_coordinates[f + 3*NVIS_PER_BLOCK];
+			
+			double2 vis;
+			vis.x = 0; vis.y = 0;
+			int local_x = (threadIdx.x&7);
+			int local_y = (threadIdx.x>>3);
+			grid_offset = blockIdx.y*const_params::grid_z*const_params::grid_y*const_params::grid_x + grid_offset + local_y*const_params::grid_y + local_x;
+			
+			for (int z = 0; z < const_params::w_kernel_size; z++) {
+				double2 grid_value = d_subgrid[grid_offset + z*const_params::grid_x*const_params::grid_y];
+				
+				//vis.x += d_gcf_w_kernel[sub_offset_z + z]*d_gcf_uv_kernel[sub_offset_y + local_y]*d_gcf_uv_kernel[sub_offset_x + local_x]*grid_value.x;
+				//vis.y += d_gcf_w_kernel[sub_offset_z + z]*d_gcf_uv_kernel[sub_offset_y + local_y]*d_gcf_uv_kernel[sub_offset_x + local_x]*grid_value.y;
+				vis.x += d_gcf_w_kernel[sub_offset_z + z]*grid_value.x;
+				vis.y += d_gcf_w_kernel[sub_offset_z + z]*grid_value.y;
+			}
+			vis.x *= d_gcf_uv_kernel[sub_offset_y + local_y]*d_gcf_uv_kernel[sub_offset_x + local_x];
+			vis.y *= d_gcf_uv_kernel[sub_offset_y + local_y]*d_gcf_uv_kernel[sub_offset_x + local_x];
+			
+			// NOTE: Reduction checked
+			s_local[threadIdx.x] = vis;
+			__syncthreads();
+			double2 sum;
+			sum = Reduce_SM(s_local);
+			Reduce_WARP(&sum);	
+			__syncthreads();
+			
+			if(threadIdx.x==0) {
+				int pos = nVisibilities[blockIdx.y] + blockIdx.x*NVIS_PER_BLOCK + f;
+				d_output_visibilities[pos] = sum;
+			}
+		}
+	}
+}
+
+
+template<class const_params>
+__global__ void GPU_SKA_degrid_kernel_mk3_for_dynamic(
+		double2 *d_output_visibilities, 
+		double *d_gcf_uv_kernel, 
+		double *d_gcf_w_kernel, 
+		double2 *d_subgrid, 
+		double *d_u_vis_pos, 
+		double *d_v_vis_pos, 
+		double *d_w_vis_pos, 
+		int *nVisibilities, 
+		double theta,
+		double wstep,
+		int block_y
+	){
+	extern __shared__ double2 s_local[];
+	int active_nVisibilities = nVisibilities[block_y + 1] - nVisibilities[block_y];
+	__shared__ int s_coordinates[NVIS_PER_BLOCK*4];
+	if(blockIdx.x*NVIS_PER_BLOCK >= active_nVisibilities) {
+		return;
+	}
+	
+	// precalculate coordinates;
+	if(threadIdx.x<NVIS_PER_BLOCK){
+		int grid_offset, sub_offset_x, sub_offset_y, sub_offset_z;
+		int pos = nVisibilities[block_y] + blockIdx.x*NVIS_PER_BLOCK + threadIdx.x;
+		calculate_coordinates<const_params>(
+			theta, wstep, 
+			d_u_vis_pos[pos], 
+			d_v_vis_pos[pos], 
+			d_w_vis_pos[pos],
+			&grid_offset, 
+			&sub_offset_x, &sub_offset_y, &sub_offset_z
+		);
+		s_coordinates[threadIdx.x                   ] = grid_offset;
+		s_coordinates[threadIdx.x + NVIS_PER_BLOCK  ] = sub_offset_x;
+		s_coordinates[threadIdx.x + 2*NVIS_PER_BLOCK] = sub_offset_y;
+		s_coordinates[threadIdx.x + 3*NVIS_PER_BLOCK] = sub_offset_z;
+	}
+	__syncthreads();
+	
+	
+	for(int f=0; f<NVIS_PER_BLOCK; f++){
+		if( blockIdx.x*NVIS_PER_BLOCK + f < active_nVisibilities ){
+			int grid_offset, sub_offset_x, sub_offset_y, sub_offset_z;
+			grid_offset  = s_coordinates[f];
+			sub_offset_x = s_coordinates[f + NVIS_PER_BLOCK  ];
+			sub_offset_y = s_coordinates[f + 2*NVIS_PER_BLOCK];
+			sub_offset_z = s_coordinates[f + 3*NVIS_PER_BLOCK];
+			
+			double2 vis;
+			vis.x = 0; vis.y = 0;
+			int local_x = (threadIdx.x&7);
+			int local_y = (threadIdx.x>>3);
+			grid_offset = block_y*const_params::grid_z*const_params::grid_y*const_params::grid_x + grid_offset + local_y*const_params::grid_y + local_x;
+			
+			for (int z = 0; z < const_params::w_kernel_size; z++) {
+				double2 grid_value = d_subgrid[grid_offset + z*const_params::grid_x*const_params::grid_y];
+				
+				//vis.x += d_gcf_w_kernel[sub_offset_z + z]*d_gcf_uv_kernel[sub_offset_y + local_y]*d_gcf_uv_kernel[sub_offset_x + local_x]*grid_value.x;
+				//vis.y += d_gcf_w_kernel[sub_offset_z + z]*d_gcf_uv_kernel[sub_offset_y + local_y]*d_gcf_uv_kernel[sub_offset_x + local_x]*grid_value.y;
+				vis.x += d_gcf_w_kernel[sub_offset_z + z]*grid_value.x;
+				vis.y += d_gcf_w_kernel[sub_offset_z + z]*grid_value.y;
+			}
+			vis.x *= d_gcf_uv_kernel[sub_offset_y + local_y]*d_gcf_uv_kernel[sub_offset_x + local_x];
+			vis.y *= d_gcf_uv_kernel[sub_offset_y + local_y]*d_gcf_uv_kernel[sub_offset_x + local_x];
+			
+			// NOTE: Reduction checked
+			s_local[threadIdx.x] = vis;
+			__syncthreads();
+			double2 sum;
+			sum = Reduce_SM(s_local);
+			Reduce_WARP(&sum);	
+			__syncthreads();
+			
+			if(threadIdx.x==0) {
+				int pos = nVisibilities[block_y] + blockIdx.x*NVIS_PER_BLOCK + f;
+				d_output_visibilities[pos] = sum;
+			}
+		}
+	}
+}
+
+
+template<class const_params>
+__global__ void GPU_SKA_degrid_kernel_mk3_dynamic(
+		double2 *d_output_visibilities, 
+		double *d_gcf_uv_kernel, 
+		double *d_gcf_w_kernel, 
+		double2 *d_subgrid, 
+		double *d_u_vis_pos, 
+		double *d_v_vis_pos, 
+		double *d_w_vis_pos, 
+		int *d_nVisibilities, 
+		double theta,
+		double wstep
+	){
+	// each thread represent one subgrid
+	int active_nVisibilities = d_nVisibilities[threadIdx.x + 1] - d_nVisibilities[threadIdx.x];
+	dim3 gridSize((active_nVisibilities + NVIS_PER_BLOCK - 1)/NVIS_PER_BLOCK, 1, 1);
+	dim3 blockSize(const_params::uv_kernel_stride*const_params::uv_kernel_stride, 1, 1);
+	int shared_mem = const_params::uv_kernel_stride*const_params::uv_kernel_stride*sizeof(double2);
+	GPU_SKA_degrid_kernel_mk3_for_dynamic<const_params><<< gridSize , blockSize, shared_mem >>>(
+		d_output_visibilities, 
+		d_gcf_uv_kernel,
+		d_gcf_w_kernel,
+		d_subgrid,
+		d_u_vis_pos, 
+		d_v_vis_pos, 
+		d_w_vis_pos, 
+		d_nVisibilities, 
+		theta, 
+		wstep,
+		threadIdx.x
+	);
+	
+}
+
+template<class const_params>
+__global__ void GPU_SKA_degrid_kernel_mk5(
+		double2 *d_output_visibilities, 
+		double *d_gcf_uv_kernel, 
+		double *d_gcf_w_kernel, 
+		double2 *d_subgrid, 
+		double *d_vis_pos, 
+		int *nVisibilities, 
+		double theta,
+		double wstep
+	){
+	extern __shared__ double2 s_local[];
+	int active_nVisibilities = nVisibilities[blockIdx.y + 1] - nVisibilities[blockIdx.y];
+	__shared__ int s_coordinates[NVIS_PER_BLOCK*4];
+	if(blockIdx.x*NVIS_PER_BLOCK >= active_nVisibilities) {
+		return;
+	}
+	
+	// precalculate coordinates;
+	if(threadIdx.x<NVIS_PER_BLOCK){
+		int grid_offset, sub_offset_x, sub_offset_y, sub_offset_z;
+		int pos = nVisibilities[blockIdx.y] + blockIdx.x*NVIS_PER_BLOCK + threadIdx.x;
+		calculate_coordinates<const_params>(
+			theta, wstep, 
+			d_vis_pos[3*pos], 
+			d_vis_pos[3*pos + 1], 
+			d_vis_pos[3*pos + 2],
+			&grid_offset, 
+			&sub_offset_x, &sub_offset_y, &sub_offset_z
+		);
+		s_coordinates[threadIdx.x                   ] = grid_offset;
+		s_coordinates[threadIdx.x + NVIS_PER_BLOCK  ] = sub_offset_x;
+		s_coordinates[threadIdx.x + 2*NVIS_PER_BLOCK] = sub_offset_y;
+		s_coordinates[threadIdx.x + 3*NVIS_PER_BLOCK] = sub_offset_z;
+	}
+	__syncthreads();
+	
+	
+	for(int f=0; f<NVIS_PER_BLOCK; f++){
+		if( blockIdx.x*NVIS_PER_BLOCK + f < active_nVisibilities ){
+			int grid_offset, sub_offset_x, sub_offset_y, sub_offset_z;
+			grid_offset  = s_coordinates[f];
+			sub_offset_x = s_coordinates[f + NVIS_PER_BLOCK  ];
+			sub_offset_y = s_coordinates[f + 2*NVIS_PER_BLOCK];
+			sub_offset_z = s_coordinates[f + 3*NVIS_PER_BLOCK];
+			
+			double2 vis;
+			vis.x = 0; vis.y = 0;
+			int local_x = (threadIdx.x&7);
+			int local_y = (threadIdx.x>>3);
+			grid_offset = blockIdx.y*const_params::grid_z*const_params::grid_y*const_params::grid_x + grid_offset + local_y*const_params::grid_y + local_x;
+			
+			for (int z = 0; z < const_params::w_kernel_size; z++) {
+				double2 grid_value = d_subgrid[grid_offset + z*const_params::grid_x*const_params::grid_y];
+				
+				//vis.x += d_gcf_w_kernel[sub_offset_z + z]*d_gcf_uv_kernel[sub_offset_y + local_y]*d_gcf_uv_kernel[sub_offset_x + local_x]*grid_value.x;
+				//vis.y += d_gcf_w_kernel[sub_offset_z + z]*d_gcf_uv_kernel[sub_offset_y + local_y]*d_gcf_uv_kernel[sub_offset_x + local_x]*grid_value.y;
+				vis.x += d_gcf_w_kernel[sub_offset_z + z]*grid_value.x;
+				vis.y += d_gcf_w_kernel[sub_offset_z + z]*grid_value.y;
+			}
+			vis.x *= d_gcf_uv_kernel[sub_offset_y + local_y]*d_gcf_uv_kernel[sub_offset_x + local_x];
+			vis.y *= d_gcf_uv_kernel[sub_offset_y + local_y]*d_gcf_uv_kernel[sub_offset_x + local_x];
+			
+			// NOTE: Reduction checked
+			s_local[threadIdx.x] = vis;
+			__syncthreads();
+			double2 sum;
+			sum = Reduce_SM(s_local);
+			Reduce_WARP(&sum);	
+			__syncthreads();
+			
+			if(threadIdx.x==0) {
+				int pos = nVisibilities[blockIdx.y] + blockIdx.x*NVIS_PER_BLOCK + f;
+				d_output_visibilities[pos] = sum;
+			}
+		}
+	}
+}
 
 void SKA_init(){
 	//---------> Specific nVidia stuff
 	//cudaDeviceSetCacheConfig(cudaFuncCachePreferShared);
-	cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);
+	cudaDeviceSetCacheConfig(cudaFuncCachePreferEqual);
+	//cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);
 	cudaDeviceSetSharedMemConfig(cudaSharedMemBankSizeFourByte);
 }
 
 
-int SKA_degrid_benchmark(
+int SKA_degrid_benchmark_mk1(
 		double2 *d_output_visibilities, 
 		double *d_gcf_uv_kernel, 
 		int uv_kernel_size, 
@@ -198,7 +628,8 @@ int SKA_degrid_benchmark(
 		double *d_u_vis_pos, 
 		double *d_v_vis_pos, 
 		double *d_w_vis_pos, 
-		int nVisibilities, 
+		int *d_nVisibilities,
+		int max_nVisibilities,
 		int nSubgrids,
 		double theta,
 		double wstep,
@@ -207,7 +638,7 @@ int SKA_degrid_benchmark(
 	GpuTimer timer;
 	
 	//---------> Task specific
-	dim3 gridSize(nVisibilities, nSubgrids, 1);
+	dim3 gridSize(max_nVisibilities, nSubgrids, 1);
 	dim3 blockSize(uv_kernel_stride*uv_kernel_stride, 1, 1);
 	size_t shared_mem = uv_kernel_stride*uv_kernel_stride*sizeof(double2);
 	
@@ -220,25 +651,16 @@ int SKA_degrid_benchmark(
 	
 	//---------> Pulse detection FIR
 	SKA_init();
-	GPU_SKA_degrid_kernel_mk1<SKA_degrid_params><<< gridSize , blockSize, shared_mem >>>(
+	GPU_SKA_degrid_kernel_mk1<SKA_degrid_8_8_4><<< gridSize , blockSize, shared_mem >>>(
 		d_output_visibilities, 
-		d_gcf_uv_kernel, 
-		uv_kernel_size, 
-		uv_kernel_stride, 
-		uv_kernel_oversampling, 
-		d_gcf_w_kernel, 
-		w_kernel_size, 
-		w_kernel_stride, 
-		w_kernel_oversampling, 
-		d_subgrid, 
-		grid_z, 
-		grid_y, 
-		grid_x, 
+		d_gcf_uv_kernel,
+		d_gcf_w_kernel,
+		d_subgrid,
 		d_u_vis_pos, 
 		d_v_vis_pos, 
 		d_w_vis_pos, 
-		nVisibilities, 
-		theta,
+		d_nVisibilities, 
+		theta, 
 		wstep
 	);
 	
@@ -248,6 +670,302 @@ int SKA_degrid_benchmark(
 	// ----------------------------------------------->
 	return(0);
 }
+
+int SKA_degrid_benchmark_mk1_dynamic(
+		double2 *d_output_visibilities, 
+		double *d_gcf_uv_kernel, 
+		int uv_kernel_size, 
+		int uv_kernel_stride, 
+		int uv_kernel_oversampling, 
+		double *d_gcf_w_kernel, 
+		int w_kernel_size, 
+		int w_kernel_stride, 
+		int w_kernel_oversampling, 
+		double2 *d_subgrid, 
+		int grid_z, 
+		int grid_y, 
+		int grid_x, 
+		double *d_u_vis_pos, 
+		double *d_v_vis_pos, 
+		double *d_w_vis_pos, 
+		int *d_nVisibilities,
+		int max_nVisibilities,
+		int nSubgrids,
+		double theta,
+		double wstep,
+		double *exec_time
+	){
+	GpuTimer timer;
+	
+	//---------> Task specific
+	dim3 gridSize(1, 1, 1);
+	dim3 blockSize(nSubgrids, 1, 1);
+	
+	if(DEBUG) printf("Grid  settings: x:%d; y:%d; z:%d;\n", gridSize.x, gridSize.y, gridSize.z);
+	if(DEBUG) printf("Block settings: x:%d; y:%d; z:%d;\n", blockSize.x, blockSize.y, blockSize.z);
+	
+	// ----------------------------------------------->
+	// --------> Measured part
+	timer.Start();
+	
+	//---------> Pulse detection FIR
+	SKA_init();
+	GPU_SKA_degrid_kernel_mk1_dynamic<SKA_degrid_8_8_4><<< gridSize , blockSize >>>(
+		d_output_visibilities, 
+		d_gcf_uv_kernel,
+		d_gcf_w_kernel,
+		d_subgrid,
+		d_u_vis_pos, 
+		d_v_vis_pos, 
+		d_w_vis_pos, 
+		d_nVisibilities, 
+		theta, 
+		wstep
+	);
+	
+	timer.Stop();
+	*exec_time += timer.Elapsed();
+	// --------> Measured part
+	// ----------------------------------------------->
+	return(0);
+}
+
+int SKA_degrid_benchmark_mk2(
+		double2 *d_output_visibilities, 
+		double *d_gcf_uv_kernel, 
+		int uv_kernel_size, 
+		int uv_kernel_stride, 
+		int uv_kernel_oversampling, 
+		double *d_gcf_w_kernel, 
+		int w_kernel_size, 
+		int w_kernel_stride, 
+		int w_kernel_oversampling, 
+		double2 *d_subgrid, 
+		int grid_z, 
+		int grid_y, 
+		int grid_x, 
+		double *d_u_vis_pos, 
+		double *d_v_vis_pos, 
+		double *d_w_vis_pos, 
+		int *d_nVisibilities,
+		int max_nVisibilities,
+		int nSubgrids,
+		double theta,
+		double wstep,
+		double *exec_time
+	){
+	GpuTimer timer;
+	
+	//---------> Task specific
+	dim3 gridSize((int) ((max_nVisibilities + NVIS_PER_BLOCK - 1)/NVIS_PER_BLOCK), nSubgrids, 1);
+	dim3 blockSize(uv_kernel_stride*uv_kernel_stride, 1, 1);
+	size_t shared_mem = uv_kernel_stride*uv_kernel_stride*sizeof(double2);
+	
+	if(DEBUG) printf("Grid  settings: x:%d; y:%d; z:%d;\n", gridSize.x, gridSize.y, gridSize.z);
+	if(DEBUG) printf("Block settings: x:%d; y:%d; z:%d;\n", blockSize.x, blockSize.y, blockSize.z);
+	
+	// ----------------------------------------------->
+	// --------> Measured part
+	timer.Start();
+	
+	//---------> Pulse detection FIR
+	SKA_init();
+	GPU_SKA_degrid_kernel_mk2<SKA_degrid_8_8_4><<< gridSize , blockSize, shared_mem >>>(
+		d_output_visibilities, 
+		d_gcf_uv_kernel,
+		d_gcf_w_kernel,
+		d_subgrid,
+		d_u_vis_pos, 
+		d_v_vis_pos, 
+		d_w_vis_pos, 
+		d_nVisibilities, 
+		theta, 
+		wstep
+	);
+	
+	timer.Stop();
+	*exec_time += timer.Elapsed();
+	// --------> Measured part
+	// ----------------------------------------------->
+	return(0);
+}
+
+int SKA_degrid_benchmark_mk3(
+		double2 *d_output_visibilities, 
+		double *d_gcf_uv_kernel, 
+		int uv_kernel_size, 
+		int uv_kernel_stride, 
+		int uv_kernel_oversampling, 
+		double *d_gcf_w_kernel, 
+		int w_kernel_size, 
+		int w_kernel_stride, 
+		int w_kernel_oversampling, 
+		double2 *d_subgrid, 
+		int grid_z, 
+		int grid_y, 
+		int grid_x, 
+		double *d_u_vis_pos, 
+		double *d_v_vis_pos, 
+		double *d_w_vis_pos, 
+		int *d_nVisibilities,
+		int max_nVisibilities,
+		int nSubgrids,
+		double theta,
+		double wstep,
+		double *exec_time
+	){
+	GpuTimer timer;
+	
+	//---------> Task specific
+	dim3 gridSize((int) ((max_nVisibilities + NVIS_PER_BLOCK - 1)/NVIS_PER_BLOCK), nSubgrids, 1);
+	dim3 blockSize(uv_kernel_stride*uv_kernel_stride, 1, 1);
+	size_t shared_mem = uv_kernel_stride*uv_kernel_stride*sizeof(double2);
+	
+	if(DEBUG) printf("Grid  settings: x:%d; y:%d; z:%d;\n", gridSize.x, gridSize.y, gridSize.z);
+	if(DEBUG) printf("Block settings: x:%d; y:%d; z:%d;\n", blockSize.x, blockSize.y, blockSize.z);
+	
+	// ----------------------------------------------->
+	// --------> Measured part
+	timer.Start();
+	
+	//---------> Pulse detection FIR
+	SKA_init();
+	GPU_SKA_degrid_kernel_mk3<SKA_degrid_8_8_4><<< gridSize , blockSize, shared_mem >>>(
+		d_output_visibilities, 
+		d_gcf_uv_kernel,
+		d_gcf_w_kernel,
+		d_subgrid,
+		d_u_vis_pos, 
+		d_v_vis_pos, 
+		d_w_vis_pos, 
+		d_nVisibilities, 
+		theta, 
+		wstep
+	);
+	
+	timer.Stop();
+	*exec_time += timer.Elapsed();
+	// --------> Measured part
+	// ----------------------------------------------->
+	return(0);
+}
+
+int SKA_degrid_benchmark_mk3_dynamic(
+		double2 *d_output_visibilities, 
+		double *d_gcf_uv_kernel, 
+		int uv_kernel_size, 
+		int uv_kernel_stride, 
+		int uv_kernel_oversampling, 
+		double *d_gcf_w_kernel, 
+		int w_kernel_size, 
+		int w_kernel_stride, 
+		int w_kernel_oversampling, 
+		double2 *d_subgrid, 
+		int grid_z, 
+		int grid_y, 
+		int grid_x, 
+		double *d_u_vis_pos, 
+		double *d_v_vis_pos, 
+		double *d_w_vis_pos, 
+		int *d_nVisibilities,
+		int max_nVisibilities,
+		int nSubgrids,
+		double theta,
+		double wstep,
+		double *exec_time
+	){
+	GpuTimer timer;
+	
+	//---------> Task specific
+	dim3 gridSize(1, 1, 1);
+	dim3 blockSize(nSubgrids, 1, 1);
+	
+	if(DEBUG) printf("Grid  settings: x:%d; y:%d; z:%d;\n", gridSize.x, gridSize.y, gridSize.z);
+	if(DEBUG) printf("Block settings: x:%d; y:%d; z:%d;\n", blockSize.x, blockSize.y, blockSize.z);
+	
+	// ----------------------------------------------->
+	// --------> Measured part
+	timer.Start();
+	
+	//---------> Pulse detection FIR
+	SKA_init();
+	GPU_SKA_degrid_kernel_mk3_dynamic<SKA_degrid_8_8_4><<< gridSize , blockSize >>>(
+		d_output_visibilities, 
+		d_gcf_uv_kernel,
+		d_gcf_w_kernel,
+		d_subgrid,
+		d_u_vis_pos, 
+		d_v_vis_pos, 
+		d_w_vis_pos, 
+		d_nVisibilities, 
+		theta, 
+		wstep
+	);
+	
+	timer.Stop();
+	*exec_time += timer.Elapsed();
+	// --------> Measured part
+	// ----------------------------------------------->
+	return(0);
+}
+
+int SKA_degrid_benchmark_mk5(
+		double2 *d_output_visibilities, 
+		double *d_gcf_uv_kernel, 
+		int uv_kernel_size, 
+		int uv_kernel_stride, 
+		int uv_kernel_oversampling, 
+		double *d_gcf_w_kernel, 
+		int w_kernel_size, 
+		int w_kernel_stride, 
+		int w_kernel_oversampling, 
+		double2 *d_subgrid, 
+		int grid_z, 
+		int grid_y, 
+		int grid_x, 
+		double *d_vis_pos, 
+		int *d_nVisibilities,
+		int max_nVisibilities,
+		int nSubgrids,
+		double theta,
+		double wstep,
+		double *exec_time
+	){
+	GpuTimer timer;
+	
+	//---------> Task specific
+	dim3 gridSize((int) ((max_nVisibilities + NVIS_PER_BLOCK - 1)/NVIS_PER_BLOCK), nSubgrids, 1);
+	dim3 blockSize(uv_kernel_stride*uv_kernel_stride, 1, 1);
+	size_t shared_mem = uv_kernel_stride*uv_kernel_stride*sizeof(double2);
+	
+	if(DEBUG) printf("Grid  settings: x:%d; y:%d; z:%d;\n", gridSize.x, gridSize.y, gridSize.z);
+	if(DEBUG) printf("Block settings: x:%d; y:%d; z:%d;\n", blockSize.x, blockSize.y, blockSize.z);
+	
+	// ----------------------------------------------->
+	// --------> Measured part
+	timer.Start();
+	
+	//---------> Pulse detection FIR
+	SKA_init();
+	GPU_SKA_degrid_kernel_mk5<SKA_degrid_8_8_4><<< gridSize , blockSize, shared_mem >>>(
+		d_output_visibilities, 
+		d_gcf_uv_kernel,
+		d_gcf_w_kernel,
+		d_subgrid,
+		d_vis_pos, 
+		d_nVisibilities, 
+		theta, 
+		wstep
+	);
+	
+	timer.Stop();
+	*exec_time += timer.Elapsed();
+	// --------> Measured part
+	// ----------------------------------------------->
+	return(0);
+}
+
+
 
 
 int check_memory(size_t total_size, float multiple){
@@ -278,11 +996,14 @@ int GPU_SKA_degrid(
 		int grid_x, 
 		double *h_u_vis_pos, 
 		double *h_v_vis_pos, 
-		double *h_w_vis_pos, 
-		int nVisibilities, 
+		double *h_w_vis_pos,
+		size_t total_nVisibilities,
+		int *h_nVisibilities, 
+		int max_nVisibilities, 
 		int nSubgrids,
 		double theta,
 		double wstep,
+		int kernel_type,
 		int nRuns,
 		int device,
 		double *execution_time
@@ -296,9 +1017,17 @@ int GPU_SKA_degrid(
 	size_t uv_kernel_size_in_bytes             = uv_kernel_stride*uv_kernel_oversampling*sizeof(double);
 	size_t w_kernel_size_in_bytes              = w_kernel_stride*w_kernel_oversampling*sizeof(double);
 	size_t subgrid_size_in_bytes               = grid_z*grid_y*grid_x*sizeof(double2)*nSubgrids;
-	size_t visibilities_position_size_in_bytes = nVisibilities*sizeof(double)*nSubgrids;
-	size_t output_size_in_bytes                = nVisibilities*sizeof(double2)*nSubgrids;
+	size_t visibilities_position_size_in_bytes = total_nVisibilities*sizeof(double);
+	size_t output_size_in_bytes                = total_nVisibilities*sizeof(double2);
 	size_t total_memory_required_in_bytes      = uv_kernel_size_in_bytes + w_kernel_size_in_bytes + subgrid_size_in_bytes + visibilities_position_size_in_bytes + output_size_in_bytes;
+	
+	printf("uv_kernel_size_in_bytes            : %zu;\n", uv_kernel_size_in_bytes);
+	printf("w_kernel_size_in_bytes             : %zu;\n", w_kernel_size_in_bytes);
+	printf("subgrid_size_in_bytes              : %zu;\n", subgrid_size_in_bytes);
+	printf("visibilities_position_size_in_bytes: %zu;\n", visibilities_position_size_in_bytes);
+	printf("output_size_in_bytes               : %zu;\n", output_size_in_bytes);
+	printf("total_memory_required_in_bytes     : %zu;\n", total_memory_required_in_bytes);
+	
 	
 	//---------> Checking memory
 	if(check_memory(total_memory_required_in_bytes, 1.0)!=0) return(1);
@@ -306,6 +1035,16 @@ int GPU_SKA_degrid(
 	//---------> Measurements
 	double exec_time = 0;
 	GpuTimer timer;
+	
+	//---------> Measurements
+	printf("Preparing one visibility array...\n");
+	double *h_vis_pos;
+	h_vis_pos = new double[3*total_nVisibilities];
+	for(size_t f=0; f<total_nVisibilities; f++){
+		h_vis_pos[3*f + 0] = h_u_vis_pos[f];
+		h_vis_pos[3*f + 1] = h_v_vis_pos[f];
+		h_vis_pos[3*f + 2] = h_w_vis_pos[f];
+	}
 
 	//---------> Memory allocation
 	if (DEBUG) printf("Device memory allocation...: \t\t");
@@ -316,6 +1055,8 @@ int GPU_SKA_degrid(
 	double *d_u_vis_pos;
 	double *d_v_vis_pos;
 	double *d_w_vis_pos;
+	double *d_vis_pos;
+	int *d_nVisibilities;
 	timer.Start();
 	checkCudaErrors(cudaMalloc((void **) &d_subgrid,             subgrid_size_in_bytes));
 	checkCudaErrors(cudaMalloc((void **) &d_output_visibilities, output_size_in_bytes));
@@ -324,47 +1065,234 @@ int GPU_SKA_degrid(
 	checkCudaErrors(cudaMalloc((void **) &d_u_vis_pos,           visibilities_position_size_in_bytes));
 	checkCudaErrors(cudaMalloc((void **) &d_v_vis_pos,           visibilities_position_size_in_bytes));
 	checkCudaErrors(cudaMalloc((void **) &d_w_vis_pos,           visibilities_position_size_in_bytes));
+	checkCudaErrors(cudaMalloc((void **) &d_vis_pos,             3*visibilities_position_size_in_bytes));
+	checkCudaErrors(cudaMalloc((void **) &d_nVisibilities,       (nSubgrids+1)*sizeof(int)));
 	timer.Stop();
 	if (DEBUG) printf("done in %g ms.\n", timer.Elapsed());
 
-	//---------> FFT calculation
+	//---------> degridding calculation
 		//-----> Copy chunk of input data to a device
+		timer.Start();
 		checkCudaErrors(cudaMemcpy(d_subgrid,       h_subgrid,       subgrid_size_in_bytes,               cudaMemcpyHostToDevice));
 		checkCudaErrors(cudaMemcpy(d_gcf_uv_kernel, h_gcf_uv_kernel, uv_kernel_size_in_bytes,             cudaMemcpyHostToDevice));
 		checkCudaErrors(cudaMemcpy(d_gcf_w_kernel,  h_gcf_w_kernel,  w_kernel_size_in_bytes,              cudaMemcpyHostToDevice));
 		checkCudaErrors(cudaMemcpy(d_u_vis_pos,     h_u_vis_pos,     visibilities_position_size_in_bytes, cudaMemcpyHostToDevice));
 		checkCudaErrors(cudaMemcpy(d_v_vis_pos,     h_v_vis_pos,     visibilities_position_size_in_bytes, cudaMemcpyHostToDevice));
 		checkCudaErrors(cudaMemcpy(d_w_vis_pos,     h_w_vis_pos,     visibilities_position_size_in_bytes, cudaMemcpyHostToDevice));
+		checkCudaErrors(cudaMemcpy(d_vis_pos,       h_vis_pos,       3*visibilities_position_size_in_bytes, cudaMemcpyHostToDevice));
+		checkCudaErrors(cudaMemcpy(d_nVisibilities, h_nVisibilities, (nSubgrids+1)*sizeof(int), cudaMemcpyHostToDevice));
+		timer.Stop();
+		size_t total_size = subgrid_size_in_bytes + uv_kernel_size_in_bytes + w_kernel_size_in_bytes + 3*visibilities_position_size_in_bytes;
+		printf("Time to copy data to the device: %f; PCIe bandwidth: %f GB/s;\n", timer.Elapsed(), 1000.0*(total_size/timer.Elapsed())/(1024.0*1024.0*1024.0));
+		delete[] h_vis_pos;
 		
-		//-----> Compute LEHRMS
-		for(int f=0; f<nRuns; f++){
-			SKA_degrid_benchmark(
-				d_output_visibilities, 
-				d_gcf_uv_kernel, 
-				uv_kernel_size, 
-				uv_kernel_stride, 
-				uv_kernel_oversampling, 
-				d_gcf_w_kernel, 
-				w_kernel_size, 
-				w_kernel_stride, 
-				w_kernel_oversampling, 
-				d_subgrid, 
-				grid_z, 
-				grid_y, 
-				grid_x, 
-				d_u_vis_pos, 
-				d_v_vis_pos, 
-				d_w_vis_pos, 
-				nVisibilities, 
-				nSubgrids, 
-				theta,
-				wstep,
-				&exec_time
-			);
+		//-----> Compute degridding
+		
+		if(kernel_type==1){
+			exec_time = 0;
+			for(int f=0; f<nRuns; f++){
+				//SKA_degrid_benchmark_mk1(
+				SKA_degrid_benchmark_mk1(
+					d_output_visibilities, 
+					d_gcf_uv_kernel, 
+					uv_kernel_size, 
+					uv_kernel_stride, 
+					uv_kernel_oversampling, 
+					d_gcf_w_kernel, 
+					w_kernel_size, 
+					w_kernel_stride, 
+					w_kernel_oversampling, 
+					d_subgrid, 
+					grid_z, 
+					grid_y, 
+					grid_x, 
+					d_u_vis_pos, 
+					d_v_vis_pos, 
+					d_w_vis_pos, 
+					d_nVisibilities,
+					max_nVisibilities,
+					nSubgrids, 
+					theta,
+					wstep,
+					&exec_time
+				);
+			}
+			exec_time = exec_time/((float) nRuns);
+			*execution_time = exec_time;
+			printf("Degridding using basic finished in %fms\n", exec_time);
 		}
-		exec_time = exec_time/((float) nRuns);
 		
-		*execution_time = exec_time;
+		
+		if(kernel_type==2){
+			exec_time = 0;
+			for(int f=0; f<nRuns; f++){
+				SKA_degrid_benchmark_mk2(
+					d_output_visibilities, 
+					d_gcf_uv_kernel, 
+					uv_kernel_size, 
+					uv_kernel_stride, 
+					uv_kernel_oversampling, 
+					d_gcf_w_kernel, 
+					w_kernel_size, 
+					w_kernel_stride, 
+					w_kernel_oversampling, 
+					d_subgrid, 
+					grid_z, 
+					grid_y, 
+					grid_x, 
+					d_u_vis_pos, 
+					d_v_vis_pos, 
+					d_w_vis_pos, 
+					d_nVisibilities,
+					max_nVisibilities,
+					nSubgrids, 
+					theta,
+					wstep,
+					&exec_time
+				);
+			}
+			exec_time = exec_time/((float) nRuns);
+			*execution_time = exec_time;
+			printf("Degridding using batched GPU kernel finished in %fms\n", exec_time);
+		}
+		
+		
+		if(kernel_type==3){
+			exec_time = 0;
+			for(int f=0; f<nRuns; f++){
+				SKA_degrid_benchmark_mk3(
+					d_output_visibilities, 
+					d_gcf_uv_kernel, 
+					uv_kernel_size, 
+					uv_kernel_stride, 
+					uv_kernel_oversampling, 
+					d_gcf_w_kernel, 
+					w_kernel_size, 
+					w_kernel_stride, 
+					w_kernel_oversampling, 
+					d_subgrid, 
+					grid_z, 
+					grid_y, 
+					grid_x, 
+					d_u_vis_pos, 
+					d_v_vis_pos, 
+					d_w_vis_pos, 
+					d_nVisibilities,
+					max_nVisibilities,
+					nSubgrids, 
+					theta,
+					wstep,
+					&exec_time
+				);
+			}
+			exec_time = exec_time/((float) nRuns);
+			*execution_time = exec_time;
+			printf("Degridding using batched GPU kernel with precalculated coordinates finished in %fms\n", exec_time);
+		}
+		
+		
+		if(kernel_type==4){
+			exec_time = 0;
+			for(int f=0; f<nRuns; f++){
+				//SKA_degrid_benchmark_mk1(
+				SKA_degrid_benchmark_mk1_dynamic(
+					d_output_visibilities, 
+					d_gcf_uv_kernel, 
+					uv_kernel_size, 
+					uv_kernel_stride, 
+					uv_kernel_oversampling, 
+					d_gcf_w_kernel, 
+					w_kernel_size, 
+					w_kernel_stride, 
+					w_kernel_oversampling, 
+					d_subgrid, 
+					grid_z, 
+					grid_y, 
+					grid_x, 
+					d_u_vis_pos, 
+					d_v_vis_pos, 
+					d_w_vis_pos, 
+					d_nVisibilities,
+					max_nVisibilities,
+					nSubgrids, 
+					theta,
+					wstep,
+					&exec_time
+				);
+			}
+			exec_time = exec_time/((float) nRuns);
+			*execution_time = exec_time;
+			printf("Degridding using basic GPU kernel with dynamic parallelism finished in %fms\n", exec_time);
+		}
+
+
+		if(kernel_type==5){
+			exec_time = 0;
+			for(int f=0; f<nRuns; f++){
+				//SKA_degrid_benchmark_mk1(
+				SKA_degrid_benchmark_mk5(
+					d_output_visibilities, 
+					d_gcf_uv_kernel, 
+					uv_kernel_size, 
+					uv_kernel_stride, 
+					uv_kernel_oversampling, 
+					d_gcf_w_kernel, 
+					w_kernel_size, 
+					w_kernel_stride, 
+					w_kernel_oversampling, 
+					d_subgrid, 
+					grid_z, 
+					grid_y, 
+					grid_x, 
+					d_vis_pos, 
+					d_nVisibilities,
+					max_nVisibilities,
+					nSubgrids, 
+					theta,
+					wstep,
+					&exec_time
+				);
+			}
+			exec_time = exec_time/((float) nRuns);
+			*execution_time = exec_time;
+			printf("Degridding using batched GPU kernel with single u,v,w array finished in %fms\n", exec_time);
+		}
+		
+		
+		if(kernel_type==6){
+			exec_time = 0;
+			for(int f=0; f<nRuns; f++){
+				//SKA_degrid_benchmark_mk1(
+				SKA_degrid_benchmark_mk3_dynamic(
+					d_output_visibilities, 
+					d_gcf_uv_kernel, 
+					uv_kernel_size, 
+					uv_kernel_stride, 
+					uv_kernel_oversampling, 
+					d_gcf_w_kernel, 
+					w_kernel_size, 
+					w_kernel_stride, 
+					w_kernel_oversampling, 
+					d_subgrid, 
+					grid_z, 
+					grid_y, 
+					grid_x, 
+					d_u_vis_pos, 
+					d_v_vis_pos, 
+					d_w_vis_pos, 
+					d_nVisibilities,
+					max_nVisibilities,
+					nSubgrids, 
+					theta,
+					wstep,
+					&exec_time
+				);
+			}
+			exec_time = exec_time/((float) nRuns);
+			*execution_time = exec_time;
+			printf("Degridding using batched GPU kernel with precalculated coordinates with dynamic parallelism finished in %fms\n", exec_time);
+		}
+		
 		
 		checkCudaErrors(cudaGetLastError());
 		
@@ -383,6 +1311,8 @@ int GPU_SKA_degrid(
 	checkCudaErrors(cudaFree(d_u_vis_pos));
 	checkCudaErrors(cudaFree(d_v_vis_pos));
 	checkCudaErrors(cudaFree(d_w_vis_pos));
+	checkCudaErrors(cudaFree(d_vis_pos));
+	checkCudaErrors(cudaFree(d_nVisibilities));
 	
 	return(0);
 }
