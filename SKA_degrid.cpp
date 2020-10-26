@@ -293,6 +293,7 @@ int Generate_grid_from_zero(int start_file, int end_file, int *grid_z, int *grid
 		printf(".");
 		fflush(stdout);
 	}
+	printf("\n");
 	
 	printf("  Loading subgrids: Input size: %zu bytes = %f MB;\n", total_subgrid_size*sizeof(double2), (total_subgrid_size*sizeof(double2))/(1024.0*1024.0));
 	(*subgrid_size) = total_subgrid_size*sizeof(double2);
@@ -1006,6 +1007,7 @@ int GPU_SKA_degrid(
 		int nSubgrids, 
 		double theta,
 		double wstep,
+		int vis_per_block,
 		int kernel_type,
 		int nRuns,
 		int device, 
@@ -1029,6 +1031,7 @@ void Generate_visibilities_and_run_GPU(
 		int nSubgrids, 
 		double theta,
 		double wstep,
+		int vis_per_block,
 		int start_file,
 		int end_file,
 		int visibilities_per_subgrid_random,
@@ -1187,8 +1190,11 @@ void Generate_visibilities_and_run_GPU(
 	char kernel_str[5];
 	char vis_type_str[200];
 	sprintf(kernel_str, "mk%d", kernel_type);
+	printf("Kernel: %s\n", kernel_str);
+	printf("Visibilities per threadblock: %d\n", vis_per_block);
 	if(visibilities_per_subgrid_random>0) sprintf(vis_type_str, "random");
 	if(visibilities_per_line>0) sprintf(vis_type_str, "line");
+	printf("Test: %s%d\n", vis_type_str, test_type);
 	SKA_degrid_results.Assign(
 			uv_kernel_size, 
 			uv_kernel_stride, 
@@ -1201,6 +1207,7 @@ void Generate_visibilities_and_run_GPU(
 			grid_x, 
 			total_nVisibilities, 
 			nSubgrids,
+			vis_per_block,
 			nRuns, 
 			"SKA_degrid_results.txt", 
 			kernel_str,
@@ -1211,7 +1218,7 @@ void Generate_visibilities_and_run_GPU(
 	
 	//--------------------- SKA degrid ------------
 	printf("------------ SKA degrid --------------\n");
-	GPU_SKA_degrid(
+	int GPU_errors = GPU_SKA_degrid(
 			output_visibilities, 
 			base_gcf_uv_kernel, 
 			uv_kernel_size, 
@@ -1234,6 +1241,7 @@ void Generate_visibilities_and_run_GPU(
 			nSubgrids, 
 			theta,
 			wstep,
+			vis_per_block,
 			kernel_type,
 			nRuns, 
 			device, 
@@ -1244,9 +1252,9 @@ void Generate_visibilities_and_run_GPU(
 	if(VERBOSE) printf("    SKA degrid execution time:\033[32m%0.3f\033[0mms\n", SKA_degrid_results.degrid_time);
 	if(visibilities_per_subgrid_random>0) SKA_degrid_results.nVisibilities = visibilities_per_subgrid_random;
 	if(visibilities_per_line>0) SKA_degrid_results.nVisibilities = visibilities_per_line;
-	SKA_degrid_results.Save();
+	if(GPU_errors==0) SKA_degrid_results.Save();
 	
-	if (CHECK){
+	if (CHECK && GPU_errors==0){
 		double terror = 0, merror = 0;
 		for(int s=0; s<nSubgrids; s++){
 			int active_nVisibilities = nVisibilities[s+1] - nVisibilities[s];
@@ -1322,40 +1330,62 @@ void Generate_visibilities_and_run_GPU(
 int main(int argc, char* argv[]) {
 	int start_file = 0;
 	int end_file = 1000;
-	int visibilities_per_subgrid_random = 0;
 	float step_multiple = 1.0;
-	int visibilities_per_line = 0;
-	int device = 0;
+	int device = 1;
 	int nRuns = 1;
+	int usr_kernel_type = 0;
+	int usr_test_type = 0;
 	
 	//--------------> User input
 	char * pEnd;
-	if (argc!=2) {
+	if (argc!=5) {
 		printf("Argument error!\n");
 		printf("1) Number of subgrids\n");
+		printf("2) kernel_type; set to 0 for the benchmark tests\n");
+		printf("   Basic = 1;\n   Batched = 3;\n   Basic with dynamic parallelism = 4;\n   Batched with dynamic parallelism = 6;\n   Batched without synchronization = 8\n");
+		printf("3) test_type; set to 0 for the benchmark tests\n");
+		printf("   Vis. in line with constant number of visibilities = 1;\n   Vis. in line with increasing number of visibilities = 2;\n   Random = 3;\n");
+		printf("5) Device id\n");
         return (1);
     }
-	if (argc==2) {
-		end_file                 = strtol(argv[1],&pEnd,10);
-		start_file               = end_file;
+	if (argc==5) {
+		end_file        = strtol(argv[1],&pEnd,10);
+		start_file      = end_file;
+		usr_kernel_type = strtol(argv[2],&pEnd,10);
+		usr_test_type   = strtol(argv[3],&pEnd,10);
+		device          = strtol(argv[4],&pEnd,10);
 	}
 	
-	/*
-	if(DEBUG){
-		printf("Program arguments:\n");
-		printf("start_file: %d;\n", start_file);
-		printf("end_file: %d;\n", end_file);
-		printf("visibilities_per_subgrid_random: %d;\n", visibilities_per_subgrid_random);
-		printf("step in the visibilities: %e;\n", step_multiple);
-		printf("visibilities_per_line: %d;\n", visibilities_per_line);
-	}
-	*/
-	
-	
-	if(start_file>end_file) {
-		printf("start_file<=end_file!\n");
+	if(usr_kernel_type>8) {
+		printf("Wrong kernel type!\n");
 		return(1);
 	}
+	if(usr_test_type>3){
+		printf("Wrong test type!\n");
+		return(1);
+	}
+	
+	printf("Program arguments:\n");
+	printf("Number of subgrids: %d;\n", start_file);
+	if(usr_kernel_type!=0 && usr_test_type!=0){
+		printf("Selected kernel: ");
+		if(usr_kernel_type==1) printf("Basic;\n");
+		if(usr_kernel_type==2) printf("Batched (mk2);\n");
+		if(usr_kernel_type==3) printf("Batched with pre-calculated coordinates (mk3);\n");
+		if(usr_kernel_type==4) printf("Basic with dynamic parallelism;\n");
+		if(usr_kernel_type==5) printf("Batched with single array for coordinates;\n");
+		if(usr_kernel_type==6) printf("Batched with pre-calculated coordinates and dynamic parallelism;\n");
+		if(usr_kernel_type==7) printf("Batched (mk3) with less synchronization;\n");
+		if(usr_kernel_type==8) printf("Batched without synchronization;\n");
+		printf("Selected test: ");
+		if(usr_test_type==1) printf(" Visibilities in line with constant number of vis. per subgrid;\n");
+		if(usr_test_type==2) printf(" Visibilities in line with increasing number of vis. per subgrid;\n");
+		if(usr_test_type==3) printf(" Visibilities placed at random within a subgrid;\n");
+	}
+	else {
+		printf("Perfoming benchmark tests\n");
+	}
+	printf("Device id: %d;\n", device);
 	
 	
 	char str[200];
@@ -1384,66 +1414,119 @@ int main(int argc, char* argv[]) {
 	printf("nSubgrids=%d;\n", nSubgrids);
 
 	
-	int test_type;
-	
-	std::vector<int> nVis_test = {50, 100, 500, 1000, 10000, 100000, 1000000};
-	
-	//--------------- random positions
-	test_type = 1;
-	for(int f=0; f<(int)nVis_test.size(); f++){
-		for(int kernel_type=1; kernel_type<=6; kernel_type++){
-			Generate_visibilities_and_run_GPU(
-				base_gcf_uv_kernel, uv_kernel_size, uv_kernel_stride, uv_kernel_oversampling, 
-				base_gcf_w_kernel, w_kernel_size, w_kernel_stride, w_kernel_oversampling, 
-				base_subgrid, grid_z, grid_y, grid_x, nSubgrids, theta,	wstep,
-				start_file,
-				end_file,
-				nVis_test[f], //random
-				0, // line
-				step_multiple,
-				kernel_type,
-				test_type,
-				nRuns, device
-				);
+	if(usr_kernel_type!=0 && usr_test_type!=0){
+		int random = 0;
+		int line = 0;
+		int nvis = 10;
+		if(usr_kernel_type==1 || usr_kernel_type==4){
+			nvis = 1;
 		}
-	}
-	
-	//--------------- line
-	test_type = 1;
-	for(int f=0; f<(int)nVis_test.size(); f++){
-		for(int kernel_type=1; kernel_type<=6; kernel_type++){
-			Generate_visibilities_and_run_GPU(
-				base_gcf_uv_kernel, uv_kernel_size, uv_kernel_stride, uv_kernel_oversampling, 
-				base_gcf_w_kernel, w_kernel_size, w_kernel_stride, w_kernel_oversampling, 
-				base_subgrid, grid_z, grid_y, grid_x, nSubgrids, theta,	wstep,
-				start_file,
-				end_file,
-				0, //random
-				nVis_test[f], // line
-				step_multiple,
-				kernel_type,
-				test_type,
-				nRuns, device
-				);
+		if(usr_test_type==3) {
+			random = 100000;
 		}
+		else {
+			line = 100000;
+		}
+		Generate_visibilities_and_run_GPU(
+			base_gcf_uv_kernel, uv_kernel_size, uv_kernel_stride, uv_kernel_oversampling, 
+			base_gcf_w_kernel, w_kernel_size, w_kernel_stride, w_kernel_oversampling, 
+			base_subgrid, grid_z, grid_y, grid_x, nSubgrids, theta,	wstep,
+			nvis,
+			start_file,
+			end_file,
+			random, //random
+			line, // line
+			step_multiple,
+			usr_kernel_type,
+			usr_test_type,
+			nRuns, device
+			);
+			
 	}
+	else {
+		int test_type;
+		
+		std::vector<int> nVis_test = {65536, 131072, 262144, 524288, 1000000};
+		std::vector<int> vis_per_block = {1, 5, 7, 10, 15, 20, 32};
+		
+		//--------------- random positions
+		test_type = 1;
+		for(int f=0; f<(int)nVis_test.size(); f++){
+			for(int kernel_type=1; kernel_type<=8; kernel_type++){
+				for(int nv=0; nv<(int)vis_per_block.size(); nv++){
+					if((kernel_type==1 || kernel_type==4) && vis_per_block[nv]!=1){
+					}
+					else {
+						Generate_visibilities_and_run_GPU(
+							base_gcf_uv_kernel, uv_kernel_size, uv_kernel_stride, uv_kernel_oversampling, 
+							base_gcf_w_kernel, w_kernel_size, w_kernel_stride, w_kernel_oversampling, 
+							base_subgrid, grid_z, grid_y, grid_x, nSubgrids, theta,	wstep,
+							vis_per_block[nv],
+							start_file,
+							end_file,
+							nVis_test[f], //random
+							0, // line
+							step_multiple,
+							kernel_type,
+							test_type,
+							nRuns, device
+							);
+					}
+				}
+			}
+		}
+		
+		//--------------- line
+		test_type = 1;
+		for(int f=0; f<(int)nVis_test.size(); f++){
+			for(int kernel_type=1; kernel_type<=8; kernel_type++){
+				for(int nv=0; nv<(int)vis_per_block.size(); nv++){
+					if((kernel_type==1 || kernel_type==4) && vis_per_block[nv]!=1){
+					}
+					else {
+						Generate_visibilities_and_run_GPU(
+							base_gcf_uv_kernel, uv_kernel_size, uv_kernel_stride, uv_kernel_oversampling, 
+							base_gcf_w_kernel, w_kernel_size, w_kernel_stride, w_kernel_oversampling, 
+							base_subgrid, grid_z, grid_y, grid_x, nSubgrids, theta,	wstep,
+							vis_per_block[nv],
+							start_file,
+							end_file,
+							0, //random
+							nVis_test[f], // line
+							step_multiple,
+							kernel_type,
+							test_type,
+							nRuns, device
+							);
+					}
+				}
+			}
+		}
 
-	test_type = 2;
-	for(int f=0; f<(int)nVis_test.size(); f++){
-		for(int kernel_type=1; kernel_type<=6; kernel_type++){
-			Generate_visibilities_and_run_GPU(
-				base_gcf_uv_kernel, uv_kernel_size, uv_kernel_stride, uv_kernel_oversampling, 
-				base_gcf_w_kernel, w_kernel_size, w_kernel_stride, w_kernel_oversampling, 
-				base_subgrid, grid_z, grid_y, grid_x, nSubgrids, theta,	wstep,
-				start_file,
-				end_file,
-				0, //random
-				nVis_test[f], // line
-				step_multiple,
-				kernel_type,
-				test_type,
-				nRuns, device
-				);
+		test_type = 2;
+		for(int f=0; f<(int)nVis_test.size(); f++){
+			for(int kernel_type=1; kernel_type<=8; kernel_type++){
+				for(int nv=0; nv<(int)vis_per_block.size(); nv++){
+					if((kernel_type==1 || kernel_type==4) && vis_per_block[nv]!=1){
+					}
+					else {
+						Generate_visibilities_and_run_GPU(
+							base_gcf_uv_kernel, uv_kernel_size, uv_kernel_stride, uv_kernel_oversampling, 
+							base_gcf_w_kernel, w_kernel_size, w_kernel_stride, w_kernel_oversampling, 
+							base_subgrid, grid_z, grid_y, grid_x, nSubgrids, theta,	wstep,
+							vis_per_block[nv],
+							start_file,
+							end_file,
+							0, //random
+							nVis_test[f], // line
+							step_multiple,
+							kernel_type,
+							test_type,
+							nRuns, device
+							);
+					}
+				}
+			}
 		}
 	}
 	
